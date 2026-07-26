@@ -2038,12 +2038,12 @@ impl Client {
     }
 }
 
-fn make_symlink(target: &str, dest: &Path) -> Result<()> {
+fn make_symlink(_target: &str, dest: &Path) -> Result<()> {
     if std::fs::symlink_metadata(dest).is_ok() {
         std::fs::remove_file(dest)?;
     }
     #[cfg(unix)]
-    std::os::unix::fs::symlink(target, dest)?;
+    std::os::unix::fs::symlink(_target, dest)?;
     #[cfg(not(unix))]
     return Err("symlinks not supported on this platform".into());
     #[cfg(unix)]
