@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Speak croc's peer PAKE protocol version 2, so transfers with stock Go croc
+  work again instead of being rejected with "peer uses unsupported PAKE
+  protocol version 0". The peer exchange is now bound to the room, purpose and
+  wire transcript (new `src/pakekey.rs`: identity-bound PAKE, HKDF-SHA256 key
+  schedule over a 32-byte salt, and a mutual `pake-confirm` round before any
+  encrypted traffic), and `message.Message` carries the `v`/`f` fields.
+- Emit croc's full `Pake.Bytes()` JSON, including the `null` fields of Go's
+  `Public()` struct. A compact reply is shorter than the value it answers,
+  which made Go peers decode it over their own stored `pake1` value and derive
+  a different key on the local `ips?` probe.
+
 ## v0.1.0
 
 First release: a Rust port of [croc](https://github.com/schollz/croc)

@@ -12,6 +12,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 // Message type constants, mirroring the Go `message.Type` values.
 pub const TYPE_PAKE: &str = "pake";
+pub const TYPE_PAKE_CONFIRM: &str = "pake-confirm";
 pub const TYPE_EXTERNAL_IP: &str = "externalip";
 pub const TYPE_FINISHED: &str = "finished";
 pub const TYPE_ERROR: &str = "error";
@@ -38,6 +39,10 @@ fn from_base64<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
 pub struct Message {
     #[serde(rename = "t", default, skip_serializing_if = "String::is_empty")]
     pub typ: String,
+    /// croc's peer PAKE protocol version (`pakekey::PROTOCOL_VERSION`), set on
+    /// `pake`/`pake-confirm` messages only; peers reject a mismatch.
+    #[serde(rename = "v", default, skip_serializing_if = "is_zero")]
+    pub version: i64,
     #[serde(rename = "m", default, skip_serializing_if = "String::is_empty")]
     pub message: String,
     #[serde(
@@ -58,6 +63,11 @@ pub struct Message {
     pub bytes2: Vec<u8>,
     #[serde(rename = "n", default, skip_serializing_if = "is_zero")]
     pub num: i64,
+    /// Optional protocol extensions the peer advertises. We negotiate none, so
+    /// peers fall back to the base protocol for us; the field is kept so their
+    /// advertisements round-trip instead of failing to parse.
+    #[serde(rename = "f", default, skip_serializing_if = "Vec::is_empty")]
+    pub features: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -119,7 +129,23 @@ mod tests {
             bytes: vec![1, 2, 3, 255],
             bytes2: vec![],
             num: 42,
+            ..Default::default()
         }
+    }
+
+    #[test]
+    fn pake_fields_match_go() {
+        // Go produces: {"t":"pake","v":2,"b":"AQ==","f":["x"]}
+        let m = Message {
+            typ: TYPE_PAKE.to_string(),
+            version: 2,
+            bytes: vec![1],
+            features: vec!["x".to_string()],
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&m).unwrap();
+        assert_eq!(json, r#"{"t":"pake","v":2,"b":"AQ==","f":["x"]}"#);
+        assert_eq!(serde_json::from_str::<Message>(&json).unwrap(), m);
     }
 
     #[test]
