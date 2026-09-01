@@ -1,5 +1,7 @@
 # rusty-croc 🦀🐊
 
+> **Archived — merged into [Rusty Mill](https://github.com/Rusty-Mill/rusty_mill).** This crate now lives at [`crates/rusty_croc`](https://github.com/Rusty-Mill/rusty_mill/tree/main/crates/rusty_croc) in the Rusty Mill monorepo, which is where active development, issues, and pull requests happen now. This standalone repo is kept for historical reference only.
+
 [![CI](https://github.com/baileyrd/rusty_croc/actions/workflows/ci.yml/badge.svg)](https://github.com/baileyrd/rusty_croc/actions/workflows/ci.yml)
 
 A Rust port of [croc](https://github.com/schollz/croc) — a tool for easily and
