@@ -15,5 +15,6 @@ pub mod message;
 pub mod mnemonicode;
 pub mod models;
 pub mod pake;
+pub mod pakekey;
 pub mod tcp;
 pub mod utils;

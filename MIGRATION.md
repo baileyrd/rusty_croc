@@ -77,13 +77,17 @@ body deadline.
 ### Peer protocol (over the stapled connection)
 
 1. Peers run a second PAKE using the code phrase (minus the room prefix) —
-   default curve `p256`, recipient picks and announces the curve. From the
-   session key they derive the transfer key (PBKDF2, salt exchanged in the
-   PAKE messages).
+   default curve `p256`, recipient picks and announces the curve. The exchange
+   is bound to the room and its purpose (croc peer PAKE protocol version 2,
+   `src/pakekey`): the session key is expanded with HKDF-SHA256 over the exact
+   transcript (purpose, room, curve, both wire values, a 32-byte salt from the
+   sender) into the transfer key plus two confirmation tags, which both sides
+   exchange as `pake-confirm` before any encrypted traffic flows. A peer that
+   announces a different protocol version is rejected.
 2. Control messages are `message.Message` JSON
-   (`{"t","m","b","b2","n"}`, byte fields base64) → DEFLATE → AES-256-GCM,
-   covering: `pake`, `externalip`, `fileinfo`, `recipientready`, `finished`,
-   `error`, `close-*`.
+   (`{"t","v","m","b","b2","n","f"}`, byte fields base64) → DEFLATE → AES-256-GCM,
+   covering: `pake`, `pake-confirm`, `externalip`, `fileinfo`,
+   `recipientready`, `finished`, `error`, `close-*`.
 3. File data flows over N parallel connections (the extra relay ports), in
    chunks: `u64 LE file position ‖ chunk data`, encrypted, with per-file
    hashing (xxhash default; imohash/highwayhash options) for resume support.
@@ -149,9 +153,18 @@ These are the traps for anyone continuing this migration:
    corrupts the piped stream.
 8. **PBKDF2 with 100 iterations** (not a typo — croc's choice, presumably for
    throughput on the already-high-entropy PAKE output) and **8-byte salts**.
+   That schedule is still what the relay handshake uses; the *peer* transfer
+   key moved to the HKDF/confirmation schedule in `src/pakekey.rs`.
 9. Go's `elliptic.ScalarMult` semantics (scalar not pre-reduced) are safe to
    replicate with plain double-and-add because all four curves have prime
    order — reduction cannot change the result.
+10. **`Pake.Bytes()` marshals the whole `Public()` struct**, so the wire value
+   carries every field of Go's struct — including the private ones as `null`.
+   Emitting a compact subset is *not* equivalent: croc decodes a `pake2` reply
+   on top of the struct that still holds its own `pake1` value, and Go's JSON
+   decoder reuses that backing array whenever the reply is shorter, which
+   silently rewrites the peer's own copy of the transcript and makes the two
+   sides derive different keys.
 
 ## Verification status
 
@@ -198,7 +211,8 @@ See the mapping table.
 ### Phase 2 — the file-transfer engine (done: core)
 
 `src/croc.rs` ports the transfer state machine: peer PAKE with curve
-negotiation and salt/PBKDF2 key derivation, the optional pake1/ips?
+negotiation, the transcript-bound key schedule and `pake-confirm` round
+(`src/pakekey.rs`), the optional pake1/ips?
 handshake probe (answered for stock recipients doing local discovery),
 `fileinfo`/`recipientready` exchange, parallel chunked transfer striped
 round-robin over the relay's transfer ports (`u64 LE position ‖ data`,

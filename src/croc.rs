@@ -27,6 +27,7 @@ use crate::crypt;
 use crate::message::{self, Message};
 use crate::models;
 use crate::pake::Pake;
+use crate::pakekey;
 use crate::tcp;
 use crate::utils;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -320,8 +321,20 @@ pub struct SimpleMessage {
         deserialize_with = "b64de"
     )]
     pub bytes: Vec<u8>,
+    /// The responder's key-schedule salt (`pake2` only).
+    #[serde(
+        rename = "Bytes2",
+        serialize_with = "b64ser",
+        deserialize_with = "b64de"
+    )]
+    pub bytes2: Vec<u8>,
     #[serde(rename = "Kind")]
     pub kind: String,
+    /// Peer PAKE protocol version — peers reject a mismatch.
+    #[serde(rename = "Version")]
+    pub version: i64,
+    #[serde(rename = "Curve")]
+    pub curve: String,
 }
 
 /// `host:port` with croc's default port filled in (`normalizeRelayAddress`).
@@ -722,6 +735,7 @@ struct Route {
 fn sender_wait_for_handshake(
     control: &mut Comm,
     opts: &Options,
+    room: &str,
     local_info: &Option<Vec<String>>,
 ) -> Result<()> {
     let mut k_b: Option<Vec<u8>> = None;
@@ -734,7 +748,10 @@ fn sender_wait_for_handshake(
             Some(k) => match crypt::decrypt(&raw, k) {
                 Ok(d) => d,
                 Err(crypt::CryptError::TooShort) => raw.clone(),
-                Err(_) => return Err("handshake decryption failed (wrong code?)".into()),
+                Err(e) => {
+                    log::debug!("local-probe frame decryption failed: {e}");
+                    return Err("handshake decryption failed (wrong code?)".into());
+                }
             },
             None => raw.clone(),
         };
@@ -758,13 +775,50 @@ fn sender_wait_for_handshake(
         }
         if let Ok(sm) = serde_json::from_slice::<SimpleMessage>(&data) {
             if sm.kind == "pake1" {
-                let mut b = Pake::init_curve(pake_secret(&opts.shared_secret), 1, &opts.curve)?;
+                if sm.version != pakekey::PROTOCOL_VERSION {
+                    return Err(format!(
+                        "peer uses unsupported PAKE protocol version {}; upgrade both croc clients",
+                        sm.version
+                    )
+                    .into());
+                }
+                if sm.curve.is_empty() {
+                    return Err("local probe did not specify a curve".into());
+                }
+                let mut b = pakekey::init(
+                    pake_secret(&opts.shared_secret),
+                    1,
+                    &sm.curve,
+                    pakekey::PURPOSE_LOCAL_PROBE,
+                    room,
+                )?;
                 b.update(&sm.bytes)?;
-                k_b = Some(b.session_key()?);
+                let responder = b.bytes();
+                let mut salt = vec![0u8; pakekey::SALT_SIZE];
+                rand::thread_rng().fill_bytes(&mut salt);
+                let keys = pakekey::derive(
+                    &b.session_key()?,
+                    &pakekey::Context {
+                        purpose: pakekey::PURPOSE_LOCAL_PROBE,
+                        room,
+                        curve: &sm.curve,
+                        initiator: &sm.bytes,
+                        responder: &responder,
+                        salt: &salt,
+                    },
+                )?;
+                k_b = Some(keys.encryption_key.clone());
                 let reply = SimpleMessage {
-                    bytes: b.bytes(),
+                    bytes: responder,
+                    bytes2: salt,
                     kind: "pake2".to_string(),
+                    version: pakekey::PROTOCOL_VERSION,
+                    curve: sm.curve.clone(),
                 };
+                log::debug!(
+                    "answered local-probe pake1 (curve {}, room {room})",
+                    sm.curve
+                );
                 control.send(&serde_json::to_vec(&reply)?)?;
                 continue;
             }
@@ -781,6 +835,15 @@ pub struct Client {
     opts: Options,
     key: Option<Vec<u8>>,
     pake: Option<Pake>,
+    /// Curve the recipient chose, and the two PAKE wire values — both sides
+    /// bind the derived channel keys to this exact transcript.
+    pake_curve: String,
+    pake_initiator: Vec<u8>,
+    pake_responder: Vec<u8>,
+    /// Channel material derived from the PAKE, held until both confirmation
+    /// tags have been checked (`pake-confirm`).
+    pake_keys: pakekey::Keys,
+    pake_confirmation_pending: bool,
     control: Comm,
     control_tx: Arc<Mutex<Comm>>,
     relay_host: String,
@@ -885,6 +948,11 @@ impl Client {
             opts,
             key: None,
             pake: None,
+            pake_curve: String::new(),
+            pake_initiator: Vec::new(),
+            pake_responder: Vec::new(),
+            pake_keys: pakekey::Keys::default(),
+            pake_confirmation_pending: false,
             control,
             control_tx,
             relay_host: host,
@@ -1073,7 +1141,7 @@ impl Client {
                         tcp::connect_to_tcp_server(&local_addr, &opts2.relay_password, &room, None)
                             .map_err(|e| -> Error { format!("local relay: {e}").into() })?;
                     streams.lock().unwrap().push(control.stream().try_clone()?);
-                    sender_wait_for_handshake(&mut control, &opts2, &local_info2)?;
+                    sender_wait_for_handshake(&mut control, &opts2, &room, &local_info2)?;
                     log::debug!("sender using local relay route");
                     Ok(Route {
                         control,
@@ -1098,7 +1166,8 @@ impl Client {
                     let (mut control, banner, ipaddr, host, control_address) =
                         Client::connect_relay(&opts2)?;
                     streams.lock().unwrap().push(control.stream().try_clone()?);
-                    sender_wait_for_handshake(&mut control, &opts2, &local_info2)?;
+                    let room = room_name(&opts2.shared_secret);
+                    sender_wait_for_handshake(&mut control, &opts2, &room, &local_info2)?;
                     log::debug!("sender using remote relay route");
                     Ok(Route {
                         control,
@@ -1251,10 +1320,19 @@ impl Client {
         c.control.send(b"handshake")?;
         eprintln!("securing channel...");
         // Recipient initiates the peer PAKE (role 0) with its curve choice.
-        let pake = Pake::init_curve(pake_secret(&c.opts.shared_secret), 0, &c.opts.curve)?;
+        let pake = pakekey::init(
+            pake_secret(&c.opts.shared_secret),
+            0,
+            &c.opts.curve,
+            pakekey::PURPOSE_TRANSFER,
+            &c.room,
+        )?;
+        c.pake_curve = c.opts.curve.clone();
+        c.pake_initiator = pake.bytes();
         c.send_msg(&Message {
             typ: message::TYPE_PAKE.to_string(),
-            bytes: pake.bytes(),
+            version: pakekey::PROTOCOL_VERSION,
+            bytes: c.pake_initiator.clone(),
             bytes2: c.opts.curve.as_bytes().to_vec(),
             ..Default::default()
         })?;
@@ -1287,18 +1365,54 @@ impl Client {
     /// ask the sender for its local relay `[port, ip...]`, and if one of the
     /// candidates answers, switch the control connection to it.
     fn try_local_probe(&mut self) -> Result<()> {
-        let mut a = Pake::init_curve(pake_secret(&self.opts.shared_secret), 0, &self.opts.curve)?;
+        let mut a = pakekey::init(
+            pake_secret(&self.opts.shared_secret),
+            0,
+            &self.opts.curve,
+            pakekey::PURPOSE_LOCAL_PROBE,
+            &self.room,
+        )?;
+        let initiator = a.bytes();
         let msg = SimpleMessage {
-            bytes: a.bytes(),
+            bytes: initiator.clone(),
             kind: "pake1".to_string(),
+            version: pakekey::PROTOCOL_VERSION,
+            curve: self.opts.curve.clone(),
+            ..Default::default()
         };
         self.control.send(&serde_json::to_vec(&msg)?)?;
         let reply: SimpleMessage = serde_json::from_slice(&self.control.receive()?)?;
         if reply.kind != "pake2" {
             return Err(format!("expected pake2, got '{}'", reply.kind).into());
         }
+        if reply.version != pakekey::PROTOCOL_VERSION {
+            return Err(format!(
+                "peer uses unsupported PAKE protocol version {}; upgrade both croc clients",
+                reply.version
+            )
+            .into());
+        }
+        if reply.curve != self.opts.curve {
+            return Err(format!(
+                "local PAKE curve changed from {} to {}",
+                self.opts.curve, reply.curve
+            )
+            .into());
+        }
         a.update(&reply.bytes)?;
-        let k_a = a.session_key()?;
+        let k_a = pakekey::derive(
+            &a.session_key()?,
+            &pakekey::Context {
+                purpose: pakekey::PURPOSE_LOCAL_PROBE,
+                room: &self.room,
+                curve: &self.opts.curve,
+                initiator: &initiator,
+                responder: &reply.bytes,
+                salt: &reply.bytes2,
+            },
+        )?
+        .encryption_key
+        .clone();
 
         self.control.send(&crypt::encrypt(b"ips?", &k_a)?)?;
         let enc = self.control.receive()?;
@@ -1374,10 +1488,10 @@ impl Client {
                 }
                 if !self.opts.is_sender {
                     // Recipient re-initiates the PAKE, as in Receive().
-                    let pake_bytes = self.pake.as_ref().map(|p| p.bytes()).unwrap_or_default();
                     self.send_msg(&Message {
                         typ: message::TYPE_PAKE.to_string(),
-                        bytes: pake_bytes,
+                        version: pakekey::PROTOCOL_VERSION,
+                        bytes: self.pake_initiator.clone(),
                         bytes2: self.opts.curve.as_bytes().to_vec(),
                         ..Default::default()
                     })?;
@@ -1445,12 +1559,25 @@ impl Client {
             let mut st = self.recv.lock().unwrap();
             *st = RecvState::new();
         }
+        // The PAKE is bound to the room, so the reconnect room gets a fresh
+        // exchange and fresh channel material.
+        self.pake = None;
+        self.pake_curve = String::new();
+        self.pake_initiator = Vec::new();
+        self.pake_responder = Vec::new();
+        self.pake_keys = pakekey::Keys::default();
+        self.pake_confirmation_pending = false;
         if !self.opts.is_sender {
-            self.pake = Some(Pake::init_curve(
+            let pake = pakekey::init(
                 pake_secret(&self.opts.shared_secret),
                 0,
                 &self.opts.curve,
-            )?);
+                pakekey::PURPOSE_TRANSFER,
+                &self.room,
+            )?;
+            self.pake_curve = self.opts.curve.clone();
+            self.pake_initiator = pake.bytes();
+            self.pake = Some(pake);
         }
         Ok(())
     }
@@ -1479,10 +1606,11 @@ impl Client {
                 // deadline, like Go's 2s reconnect handshake window.
                 let stream = conn.stream().try_clone()?;
                 let opts = self.opts.clone();
+                let reconnect_room = room.clone();
                 let (tx, rx) = std::sync::mpsc::channel();
                 let mut moved = conn;
                 std::thread::spawn(move || {
-                    let r = sender_wait_for_handshake(&mut moved, &opts, &None);
+                    let r = sender_wait_for_handshake(&mut moved, &opts, &reconnect_room, &None);
                     let _ = tx.send((moved, r));
                 });
                 match rx.recv_timeout(RECONNECT_HANDSHAKE_TIMEOUT) {
@@ -1560,7 +1688,10 @@ impl Client {
             }
             let m = message::decode(self.key.as_deref(), &data)
                 .map_err(|e| -> Error { format!("problem with decoding: {e}").into() })?;
-            if m.typ != message::TYPE_PAKE && self.key.is_none() {
+            if m.typ != message::TYPE_PAKE
+                && m.typ != message::TYPE_PAKE_CONFIRM
+                && self.key.is_none()
+            {
                 return Err("unencrypted communication rejected".into());
             }
             match m.typ.as_str() {
@@ -1573,6 +1704,7 @@ impl Client {
                     break;
                 }
                 message::TYPE_PAKE => self.process_pake(&m)?,
+                message::TYPE_PAKE_CONFIRM => self.process_pake_confirm(&m)?,
                 message::TYPE_EXTERNAL_IP => {
                     if self.opts.is_sender {
                         self.send_msg(&Message {
@@ -1621,40 +1753,146 @@ impl Client {
         Ok(())
     }
 
-    /// Mirrors processMessagePake: derive the transfer key, open the data
-    /// connections, and (recipient) start the reader threads.
+    /// Mirrors processMessagePake: run the peer PAKE and derive the channel
+    /// material. The key only becomes active once both sides have proved it
+    /// with a `pake-confirm` tag (see [`Client::process_pake_confirm`]).
     fn process_pake(&mut self, m: &Message) -> Result<()> {
+        if m.version != pakekey::PROTOCOL_VERSION {
+            return Err(format!(
+                "peer uses unsupported PAKE protocol version {}; upgrade both croc clients",
+                m.version
+            )
+            .into());
+        }
+        if self.pake_confirmation_pending || self.key.is_some() {
+            return Err("pake not successful: unexpected duplicate PAKE payload".into());
+        }
         let salt;
         if self.opts.is_sender {
+            // The recipient picked the curve; answer with our wire value and a
+            // fresh key-schedule salt.
             let curve = String::from_utf8_lossy(&m.bytes2).to_string();
             log::debug!("using curve {curve}");
-            let mut pake = Pake::init_curve(pake_secret(&self.opts.shared_secret), 1, &curve)?;
+            let mut pake = pakekey::init(
+                pake_secret(&self.opts.shared_secret),
+                1,
+                &curve,
+                pakekey::PURPOSE_TRANSFER,
+                &self.room,
+            )?;
             pake.update(&m.bytes)
                 .map_err(|e| -> Error { format!("pake not successful: {e}").into() })?;
-            let mut s = vec![0u8; 8];
+            self.pake_curve = curve;
+            self.pake_initiator = m.bytes.clone();
+            self.pake_responder = pake.bytes();
+            let mut s = vec![0u8; pakekey::SALT_SIZE];
             rand::thread_rng().fill_bytes(&mut s);
             salt = s;
+            self.pake = Some(pake);
+            self.derive_pake_keys(&salt)?;
+            self.pake_confirmation_pending = true;
             // Reply (unencrypted — the peer has no key yet).
             self.send_msg(&Message {
                 typ: message::TYPE_PAKE.to_string(),
-                bytes: pake.bytes(),
+                version: pakekey::PROTOCOL_VERSION,
+                bytes: self.pake_responder.clone(),
                 bytes2: salt.clone(),
                 ..Default::default()
             })?;
-            self.pake = Some(pake);
         } else {
+            if self.pake_initiator.is_empty() || self.pake_curve.is_empty() {
+                return Err(
+                    "pake not successful: PAKE response arrived before initialization".into(),
+                );
+            }
+            if m.bytes2.len() != pakekey::SALT_SIZE {
+                return Err(format!(
+                    "pake not successful: invalid PAKE salt length {}",
+                    m.bytes2.len()
+                )
+                .into());
+            }
             let pake = self.pake.as_mut().ok_or("pake not initialized")?;
             pake.update(&m.bytes)
                 .map_err(|e| -> Error { format!("pake not successful: {e}").into() })?;
+            self.pake_responder = m.bytes.clone();
             salt = m.bytes2.clone();
+            self.derive_pake_keys(&salt)?;
+            self.pake_confirmation_pending = true;
+            // Recipient proves the key first; the sender answers in kind.
+            self.send_msg(&Message {
+                typ: message::TYPE_PAKE_CONFIRM.to_string(),
+                version: pakekey::PROTOCOL_VERSION,
+                bytes: self.pake_keys.confirmation_a.clone(),
+                ..Default::default()
+            })?;
         }
-        let mut session = self.pake.as_ref().unwrap().session_key()?;
-        let (key, _) = crypt::new_key(&session, Some(&salt))?;
-        log::debug!("generated transfer key with salt {salt:02x?}");
+        log::debug!("derived channel keys with salt {salt:02x?}");
+        Ok(())
+    }
+
+    /// Expand the raw PAKE session key into the channel material bound to the
+    /// full transcript. Mirrors `derivePakeKeys`.
+    fn derive_pake_keys(&mut self, salt: &[u8]) -> Result<()> {
+        let mut session = self
+            .pake
+            .as_ref()
+            .ok_or("pake not initialized")?
+            .session_key()?;
+        let keys = pakekey::derive(
+            &session,
+            &pakekey::Context {
+                purpose: pakekey::PURPOSE_TRANSFER,
+                room: &self.room,
+                curve: &self.pake_curve,
+                initiator: &self.pake_initiator,
+                responder: &self.pake_responder,
+                salt,
+            },
+        );
         use zeroize::Zeroize;
         session.zeroize();
-        self.set_key(key);
+        self.pake_keys = keys?;
+        Ok(())
+    }
 
+    /// Mirrors processMessagePakeConfirm: check the peer's key-confirmation
+    /// tag, then activate the encrypted channel.
+    fn process_pake_confirm(&mut self, m: &Message) -> Result<()> {
+        if m.version != pakekey::PROTOCOL_VERSION {
+            return Err(format!(
+                "peer uses unsupported PAKE protocol version {}; upgrade both croc clients",
+                m.version
+            )
+            .into());
+        }
+        if !self.pake_confirmation_pending
+            || self.pake_keys.encryption_key.is_empty()
+            || self.key.is_some()
+        {
+            return Err("pake not successful: unexpected PAKE confirmation".into());
+        }
+        if self.opts.is_sender {
+            if !pakekey::confirm(&self.pake_keys.confirmation_a, &m.bytes) {
+                return Err("pake not successful: recipient PAKE confirmation failed".into());
+            }
+            self.send_msg(&Message {
+                typ: message::TYPE_PAKE_CONFIRM.to_string(),
+                version: pakekey::PROTOCOL_VERSION,
+                bytes: self.pake_keys.confirmation_b.clone(),
+                ..Default::default()
+            })?;
+        } else if !pakekey::confirm(&self.pake_keys.confirmation_b, &m.bytes) {
+            return Err("pake not successful: sender PAKE confirmation failed".into());
+        }
+        self.set_key(self.pake_keys.encryption_key.clone());
+        self.pake_keys = pakekey::Keys::default();
+        self.pake_confirmation_pending = false;
+        self.activate_secure_channel()
+    }
+
+    /// Open the transfer connections and (recipient) start the reader threads.
+    fn activate_secure_channel(&mut self) -> Result<()> {
         // Connect to every transfer port (room "{room}-{j}") in parallel,
         // matching Go's goroutine fan-out. Each connection runs its own SIEC
         // relay handshake; doing them sequentially would serialize N slow
@@ -1700,10 +1938,12 @@ impl Client {
             }
         }
         if !self.opts.is_sender {
+            // Mirrors sendExternalIP: the sender's PAKE wire value comes back
+            // as a liveness echo alongside our external IP.
             self.send_msg(&Message {
                 typ: message::TYPE_EXTERNAL_IP.to_string(),
                 message: self.external_ip.clone(),
-                bytes: m.bytes.clone(),
+                bytes: self.pake_responder.clone(),
                 ..Default::default()
             })?;
         }
@@ -2255,11 +2495,21 @@ mod tests {
         let sm = SimpleMessage {
             bytes: b"xyz".to_vec(),
             kind: "pake1".to_string(),
+            version: pakekey::PROTOCOL_VERSION,
+            curve: "p256".to_string(),
+            ..Default::default()
         };
         assert_eq!(
             serde_json::to_string(&sm).unwrap(),
-            r#"{"Bytes":"eHl6","Kind":"pake1"}"#
+            r#"{"Bytes":"eHl6","Bytes2":"","Kind":"pake1","Version":2,"Curve":"p256"}"#
         );
+        // Go marshals nil byte slices as null; that must round-trip too.
+        let go = r#"{"Bytes":"eHl6","Bytes2":null,"Kind":"pake1","Version":2,"Curve":"p256"}"#;
+        let back: SimpleMessage = serde_json::from_str(go).unwrap();
+        assert_eq!(back.bytes, b"xyz");
+        assert!(back.bytes2.is_empty());
+        assert_eq!(back.version, 2);
+        assert_eq!(back.curve, "p256");
     }
 
     #[test]

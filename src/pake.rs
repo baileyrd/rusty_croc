@@ -547,6 +547,17 @@ pub struct Pake {
     upw: Point,
     alpha: [u8; 32],
     k: Option<Vec<u8>>,
+    /// Set by [`Pake::init_curve_with_identities`]: the curve name and the
+    /// ordered participant identities mixed into the session-key transcript.
+    /// `None` keeps the legacy (identity-free) transcript.
+    ids: Option<Identities>,
+}
+
+/// Participant binding for `pake.InitCurveWithIdentities`.
+struct Identities {
+    curve_name: String,
+    id_a: Vec<u8>,
+    id_b: Vec<u8>,
 }
 
 impl Drop for Pake {
@@ -561,6 +572,11 @@ impl Drop for Pake {
         }
     }
 }
+
+/// Domain separator for the identity-bound session key (Go:
+/// `identityTranscriptDomain`).
+const IDENTITY_TRANSCRIPT_DOMAIN: &[u8] =
+    b"github.com/schollz/pake/v3/identity-bound-session-key/v1";
 
 /// Minimal big-endian bytes, matching Go's `big.Int.Bytes()` (empty for 0).
 fn go_bytes(n: &BigUint) -> Vec<u8> {
@@ -584,6 +600,45 @@ fn coord_json(pt: &Point, idx: usize) -> String {
 impl Pake {
     /// Mirrors `pake.InitCurve(pw, role, curve)`.
     pub fn init_curve(pw: &[u8], role: u8, curve_name: &str) -> Result<Pake, PakeError> {
+        Self::init(pw, role, curve_name, None)
+    }
+
+    /// Mirrors `pake.InitCurveWithIdentities(pw, role, curve, idA, idB)`: the
+    /// wire values are unchanged, but the session key additionally commits to
+    /// the ordered participant identities and the curve name.
+    pub fn init_curve_with_identities(
+        pw: &[u8],
+        role: u8,
+        curve_name: &str,
+        id_a: &[u8],
+        id_b: &[u8],
+    ) -> Result<Pake, PakeError> {
+        if role != 0 && role != 1 {
+            return Err(PakeError::BadMessage("role must be 0 (A) or 1 (B)".into()));
+        }
+        if id_a.is_empty() || id_b.is_empty() {
+            return Err(PakeError::BadMessage(
+                "both participant identities are required".into(),
+            ));
+        }
+        Self::init(
+            pw,
+            role,
+            curve_name,
+            Some(Identities {
+                curve_name: curve_name.to_string(),
+                id_a: id_a.to_vec(),
+                id_b: id_b.to_vec(),
+            }),
+        )
+    }
+
+    fn init(
+        pw: &[u8],
+        role: u8,
+        curve_name: &str,
+        ids: Option<Identities>,
+    ) -> Result<Pake, PakeError> {
         let curve = Curve::by_name(curve_name)?;
         let (ux, uy, vx, vy) = uv_points(curve_name);
         let u: Point = Some((ux, uy));
@@ -603,6 +658,7 @@ impl Pake {
             upw: None,
             alpha: [0u8; 32],
             k: None,
+            ids,
         };
         if p.role == 0 {
             // STEP: A computes X = U·pw + G·α
@@ -617,9 +673,19 @@ impl Pake {
 
     /// JSON of the public variables, byte-format-compatible with Go's
     /// `Pake.Bytes()` (which marshals `Public()`).
+    ///
+    /// `Public()` zeroes the private fields but still marshals them, so the
+    /// trailing `"P"…"K"` nulls are part of the wire format. They are not
+    /// decoration: croc peers unmarshal a `pake2` reply on top of the struct
+    /// that still holds their own `pake1` value, and Go's decoder reuses that
+    /// backing array when the reply is shorter — a peer given a compact reply
+    /// would silently corrupt its own copy of the transcript and derive a
+    /// different channel key.
     pub fn bytes(&self) -> Vec<u8> {
         format!(
-            "{{\"Role\":{},\"Uᵤ\":{},\"Uᵥ\":{},\"Vᵤ\":{},\"Vᵥ\":{},\"Xᵤ\":{},\"Xᵥ\":{},\"Yᵤ\":{},\"Yᵥ\":{}}}",
+            "{{\"Role\":{},\"Uᵤ\":{},\"Uᵥ\":{},\"Vᵤ\":{},\"Vᵥ\":{},\"Xᵤ\":{},\"Xᵥ\":{},\"Yᵤ\":{},\"Yᵥ\":{},\
+             \"P\":null,\"Pw\":null,\"Vpwᵤ\":null,\"Vpwᵥ\":null,\"Upwᵤ\":null,\"Upwᵥ\":null,\
+             \"Aα\":null,\"Aαᵤ\":null,\"Aαᵥ\":null,\"Zᵤ\":null,\"Zᵥ\":null,\"K\":null}}",
             self.role,
             coord_json(&self.u, 0),
             coord_json(&self.u, 1),
@@ -700,12 +766,36 @@ impl Pake {
 
     /// K = SHA-256(pw ‖ X ‖ Y ‖ Z), coordinates as minimal big-endian bytes —
     /// identical to the Go hash transcript.
+    ///
+    /// With identities (`InitCurveWithIdentities`) the transcript instead is a
+    /// length-prefixed encoding of the domain string, password, both identities,
+    /// the curve name and the same coordinates.
     fn session_hash(&self, z: &Point) -> Vec<u8> {
         let mut h = Sha256::new();
-        h.update(&self.pw);
-        for (x, y) in [&self.x, &self.y, z].into_iter().flatten() {
-            h.update(go_bytes(x));
-            h.update(go_bytes(y));
+        let Some(ids) = self.ids.as_ref() else {
+            h.update(&self.pw);
+            for (x, y) in [&self.x, &self.y, z].into_iter().flatten() {
+                h.update(go_bytes(x));
+                h.update(go_bytes(y));
+            }
+            return h.finalize().to_vec();
+        };
+        let mut field = |b: &[u8]| {
+            h.update((b.len() as u64).to_le_bytes());
+            h.update(b);
+        };
+        field(IDENTITY_TRANSCRIPT_DOMAIN);
+        field(&self.pw);
+        field(&ids.id_a);
+        field(&ids.id_b);
+        field(ids.curve_name.as_bytes());
+        for pt in [&self.x, &self.y, z] {
+            let (x, y) = match pt {
+                Some((x, y)) => (go_bytes(x), go_bytes(y)),
+                None => (Vec::new(), Vec::new()),
+            };
+            field(&x);
+            field(&y);
         }
         h.finalize().to_vec()
     }
@@ -873,5 +963,31 @@ mod tests {
         assert!(s.contains("\"Role\":1"));
         assert!(s.contains("\"Uᵤ\":793136080485469241208656611513609866400481671853"));
         assert!(s.contains("\"Xᵤ\":null"));
+    }
+
+    /// Go marshals the whole (zeroed) `Public()` struct, so every field of
+    /// `pake.Pake` appears — including the private ones as `null`. Peers rely
+    /// on a role-1 reply being no shorter than the role-0 value it answers.
+    #[test]
+    fn json_has_every_go_field_and_role1_is_longer() {
+        let mut a = Pake::init_curve(b"x", 0, "p256").unwrap();
+        let mut b = Pake::init_curve(b"x", 1, "p256").unwrap();
+        b.update(&a.bytes()).unwrap();
+        a.update(&b.bytes()).unwrap();
+        let role0 = String::from_utf8(a.bytes()).unwrap();
+        let role1 = String::from_utf8(b.bytes()).unwrap();
+        for field in [
+            "Role", "Uᵤ", "Uᵥ", "Vᵤ", "Vᵥ", "Xᵤ", "Xᵥ", "Yᵤ", "Yᵥ", "P", "Pw", "Vpwᵤ", "Vpwᵥ",
+            "Upwᵤ", "Upwᵥ", "Aα", "Aαᵤ", "Aαᵥ", "Zᵤ", "Zᵥ", "K",
+        ] {
+            assert!(role1.contains(&format!("\"{field}\":")), "missing {field}");
+        }
+        assert!(role1.ends_with(",\"Zᵤ\":null,\"Zᵥ\":null,\"K\":null}"));
+        // A role-0 value never carries Y, so its reply is always the longer of
+        // the two — the property croc peers depend on when they decode a reply
+        // over their own stored value.
+        let fresh0 = Pake::init_curve(b"x", 0, "p256").unwrap();
+        assert!(role1.len() > fresh0.bytes().len());
+        assert!(role0.contains("\"Yᵤ\":"));
     }
 }
